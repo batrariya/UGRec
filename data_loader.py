@@ -39,12 +39,27 @@ class MovieLensLoader:
         # =========================
         # ===== TRAIN-TEST SPLIT ===
         # =========================
-        random.shuffle(self.interactions)
+        # Group items by user
+        user_to_items = {}
+        for u, i in self.interactions:
+            user_to_items.setdefault(u, []).append(i)
+        
+        self.train_interactions = []
+        self.test_interactions = []
 
-        split_idx = int(0.8 * len(self.interactions))
+        for u, items in user_to_items.items():
+            random.shuffle(items)
+            split_idx = int(0.8 * len(items))
+            
+            # Ensure at least 1 test item if user has > 1 interactions
+            if len(items) > 1 and split_idx == len(items):
+                split_idx -= 1
+                
+            train_items = items[:split_idx]
+            test_items = items[split_idx:]
 
-        self.train_interactions = self.interactions[:split_idx]
-        self.test_interactions = self.interactions[split_idx:]
+            self.train_interactions.extend([(u, i) for i in train_items])
+            self.test_interactions.extend([(u, i) for i in test_items])
 
         # =========================
         # ===== TRAIN GRAPH =======
