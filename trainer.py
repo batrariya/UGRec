@@ -1,5 +1,7 @@
-from loss import bpr_loss, adv_loss
-from evaluate import recall_at_k, ndcg_at_k, compute_gru
+import torch
+from loss import bpr_loss, adv_loss, l2_reg
+from evaluate import evaluate_metrics
+from bias_analysis import run_bias_analysis
 
 def train(model, data, config, opt_G, opt_A):
 
@@ -14,50 +16,81 @@ def train(model, data, config, opt_G, opt_A):
 
             # ===== Generator step =====
             pu, qi_pos = model(users, pos_items, data.user_items, data.item_users)
-            qi_neg = model.generator.item_emb(neg_items)
+            
+            # Pass negative items through the same Graph Convolutional network!
+            _, qi_neg = model(users, neg_items, data.user_items, data.item_users)
 
             loss_bpr = bpr_loss(pu, qi_pos, qi_neg)
 
+            # L2 Regularization on base (0th-hop) embeddings
+            u_e = model.generator.user_emb(users)
+            i_pos_e = model.generator.item_emb(pos_items)
+            i_neg_e = model.generator.item_emb(neg_items)
+            loss_reg = l2_reg(u_e, i_pos_e, i_neg_e) / 2.0
+
+            # ===== Adversarial step (GRL applied) =====
+            # The GRL flips gradients to the Generator. So targeting true genders 
+            # properly trains the Discriminator, while simultaneously penalizing the Generator!
             pred_g = model.predict_gender(pu)
             loss_adv = adv_loss(pred_g, genders)
 
-            loss_G = loss_bpr - config.lambda_adv * loss_adv
+            # Note: lambda_adv multiplier is handled internally by GRL during backward pass
+            loss_total = loss_bpr + loss_adv + config.lambda_reg * loss_reg
 
             opt_G.zero_grad()
-            loss_G.backward()
-            opt_G.step()
-
-            # ===== Debias step =====
-            pu_detach = pu.detach()
-
-            pred_g = model.predict_gender(pu_detach)
-            loss_A = adv_loss(pred_g, genders)
-
             opt_A.zero_grad()
-            loss_A.backward()
+            
+            loss_total.backward()
+            
+            opt_G.step()
             opt_A.step()
         
-        print(f"Epoch {epoch} | LossG: {loss_G.item():.4f} | LossA: {loss_A.item():.4f}")
+        print(f"Epoch {epoch} | Loss Total: {loss_total.item():.4f} | Loss Adv: {loss_adv.item():.4f}")
 
-        if epoch % 5 == 0:
+        if epoch % 10 == 0:
 
-            avg_recall, male_r, female_r = recall_at_k(model, data, K=20)
-            ndcg = ndcg_at_k(model, data, K=20)
+            # Compute full graph aggregated embeddings once
+            user_embs, item_embs = model.generator.get_all_embeddings(
+                data.user_items, data.item_users, data.num_users, data.num_items
+            )
 
-            # if ndcg > best_ndcg:
-            #     best_ndcg = ndcg
-            #     patience = 0
-            # else:
-            #     patience += 1
-
-            # if patience >= 5:
-            #     print("Early stopping triggered")
-            #     break
-            gru = compute_gru(male_r, female_r)
+            (
+                avg_recall, male_r, female_r,
+                avg_precision, male_pr, female_pr,
+                avg_ndcg, male_ndcg, female_ndcg,
+                gru
+            ) = evaluate_metrics(user_embs, item_embs, data, K=20, split="val")
 
             print(f"Epoch {epoch}")
-            print(f"Recall@20: {avg_recall:.4f}")
-            print(f"NDCG@20: {ndcg:.4f}")
-            print(f"Male Recall: {male_r:.4f} | Female Recall: {female_r:.4f}")
-            print(f"GRU (fairness gap): {gru:.4f}")
+            print(f"Val Recall@20: {avg_recall:.4f} | Male: {male_r:.4f} | Female: {female_r:.4f}")
+            print(f"Val Precision@20: {avg_precision:.4f} | Male: {male_pr:.4f} | Female: {female_pr:.4f}")
+            print(f"Val NDCG@20: {avg_ndcg:.4f} | Male: {male_ndcg:.4f} | Female: {female_ndcg:.4f}")
+            print(f"Val GRU (fairness gap): {gru:.4f}")
+
+    # ==========================================
+    # FINAL TESTING AFTER ALL EPOCHS
+    # ==========================================
+    print("\n===== FINAL TEST EVALUATION =====")
+    user_embs, item_embs = model.generator.get_all_embeddings(
+        data.user_items, data.item_users, data.num_users, data.num_items
+    )
+    (
+        test_avg_recall, test_male_r, test_female_r,
+        test_avg_precision, test_male_pr, test_female_pr,
+        test_avg_ndcg, test_male_ndcg, test_female_ndcg,
+        test_gru
+    ) = evaluate_metrics(user_embs, item_embs, data, K=20, split="test")
+
+    print(f"Test Recall@20: {test_avg_recall:.4f} | Male: {test_male_r:.4f} | Female: {test_female_r:.4f}")
+    print(f"Test Precision@20: {test_avg_precision:.4f} | Male: {test_male_pr:.4f} | Female: {test_female_pr:.4f}")
+    print(f"Test NDCG@20: {test_avg_ndcg:.4f} | Male: {test_male_ndcg:.4f} | Female: {test_female_ndcg:.4f}")
+    print(f"Test GRU (fairness gap): {test_gru:.4f}\n")
+
+    # run_bias_analysis(user_embs, item_embs, data, name="UGRec")
+
+    run_bias_analysis(
+        model,
+        data,
+        name="UGRec"
+    )
         

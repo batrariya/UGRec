@@ -1,92 +1,159 @@
+from collections import defaultdict
 import torch
 import numpy as np
 
-
-# ===== Recall@K =====
-def recall_at_k(model, data, K=20):
-
-    recalls = []
-    male_recalls = []
-    female_recalls = []
-
-    for u in data.test_user_items:
-
-        true_items = set(data.test_user_items[u])
-
-        # scores for all items
-        user_tensor = torch.tensor([u])
-        u_emb = model.generator.user_emb(user_tensor)
-
-        all_items = torch.arange(data.num_items)
-        item_emb = model.generator.item_emb(all_items)
-
-        scores = torch.matmul(item_emb, u_emb.squeeze())
-
+def evaluate_metrics(user_embs, item_embs, data, K=20, split="test"):
+    recalls, precisions, ndcgs = [], [], []
+    male_recalls, female_recalls = [], []
+    male_precisions, female_precisions = [], []
+    male_ndcgs, female_ndcgs = [], []
+    
+    male_exposure = defaultdict(int)
+    female_exposure = defaultdict(int)
+    male_total = 0
+    female_total = 0
+    
+    ground_truth = data.test_user_items if split == "test" else data.val_user_items
+    
+    for u in ground_truth:
+        true_items = set(ground_truth[u])
+        
+        # fast scoring with pre-computed aggregated embeddings
+        u_emb = user_embs[u]
+        scores = torch.matmul(item_embs, u_emb)
+        
         train_items = set(data.user_items.get(u, []))
-
         for item in train_items:
             scores[item] = -1e9
-
-        # top-K items
+            
         _, top_k = torch.topk(scores, K)
-        top_k = set(top_k.tolist())
-
-        hit = len(top_k & true_items)
+        top_k_list = top_k.tolist()
+        top_k_set = set(top_k_list)
+        
+        # --- Recall & Precision ---
+        hit = len(top_k_set & true_items)
         recall = hit / len(true_items)
-
+        precision = hit / K
+        
+        # --- NDCG ---
+        dcg = 0
+        for idx, item in enumerate(top_k_list):
+            if item in true_items:
+                dcg += 1 / np.log2(idx + 2)
+                
+        ideal_dcg = sum(1 / np.log2(i + 2) for i in range(min(len(true_items), K)))
+        ndcg = dcg / ideal_dcg if ideal_dcg > 0 else 0
+        
         recalls.append(recall)
-
-        # fairness split
-        if data.gender[u] == 1:
+        precisions.append(precision)
+        ndcgs.append(ndcg)
+        
+        # --- Fairness / Group Split ---
+        # if data.gender[u] == 1: # Male
+        #     male_recalls.append(recall)
+        #     male_precisions.append(precision)
+        #     male_ndcgs.append(ndcg)
+            
+        #     for item in top_k_list:
+        #         cat = data.item_category[item]
+        #         male_exposure[cat] += 1
+        #         male_total += 1
+        # else: # Female
+        #     female_recalls.append(recall)
+        #     female_precisions.append(precision)
+        #     female_ndcgs.append(ndcg)
+            
+        #     for item in top_k_list:
+        #         cat = data.item_category[item]
+        #         female_exposure[cat] += 1
+        #         female_total += 1
+                
+        if data.gender[u] == 1: # Male
             male_recalls.append(recall)
-        else:
+            male_precisions.append(precision)
+            male_ndcgs.append(ndcg)
+            
+            for item in top_k_list:
+                categories = data.item_category[item]
+                for cat in categories:
+                    male_exposure[cat] += 1
+                    male_total += 1
+        else: # Female
             female_recalls.append(recall)
-
+            female_precisions.append(precision)
+            female_ndcgs.append(ndcg)
+    
+            for item in top_k_list:
+                categories = data.item_category[item]
+                for cat in categories:
+                    female_exposure[cat] += 1
+                    female_total += 1
+    # --- Final Metrics ---
     avg_recall = np.mean(recalls)
+    avg_precision = np.mean(precisions)
+    avg_ndcg = np.mean(ndcgs)
+    
     male_recall = np.mean(male_recalls)
     female_recall = np.mean(female_recalls)
+    male_precision = np.mean(male_precisions)
+    female_precision = np.mean(female_precisions)
+    male_ndcg = np.mean(male_ndcgs)
+    female_ndcg = np.mean(female_ndcgs)
+    
+    gru = abs(male_recall - female_recall)
+    
+    # --- Exposure Distribution ---
+    male_dist = {k: v / male_total for k, v in male_exposure.items()} if male_total > 0 else {}
+    female_dist = {k: v / female_total for k, v in female_exposure.items()} if female_total > 0 else {}
+    
+    print(f"\n--- Exposure Distribution ({split}) ---")
+    print("Male:", {k: round(v, 4) for k, v in male_dist.items()})
+    print("Female:", {k: round(v, 4) for k, v in female_dist.items()})
 
-    return avg_recall, male_recall, female_recall
+    return (
+        avg_recall, male_recall, female_recall,
+        avg_precision, male_precision, female_precision,
+        avg_ndcg, male_ndcg, female_ndcg,
+        gru
+    )
 
+def compute_exposure_from_model(model, data, k=20):
 
-# ===== NDCG@K =====
-def ndcg_at_k(model, data, K=20):
+    model.eval()
 
-    def dcg(relevance):
-        return sum(rel / np.log2(idx + 2) for idx, rel in enumerate(relevance))
+    with torch.no_grad():
 
-    ndcgs = []
+        users_emb, items_emb = model.generator.get_all_embeddings(
+            data.user_items,
+            data.item_users,
+            data.num_users,
+            data.num_items
+        )
 
-    for u in data.test_user_items:
+        male_exposure = {}
+        female_exposure = {}
 
-        true_items = set(data.test_user_items[u])
+        for g in set([g for cats in data.item_category.values() for g in cats]):
+            male_exposure[g] = 0
+            female_exposure[g] = 0
 
-        user_tensor = torch.tensor([u])
-        u_emb = model.generator.user_emb(user_tensor)
+        for user in data.test_user_items:
 
-        all_items = torch.arange(data.num_items)
-        item_emb = model.generator.item_emb(all_items)
+            user_embedding = users_emb[user]
+            scores = torch.matmul(user_embedding, items_emb.T)
 
-        scores = torch.matmul(item_emb, u_emb.squeeze())
+            train_items = set(data.user_items.get(user, []))
+            scores[list(train_items)] = -1e9
 
-        train_items = set(data.user_items.get(u, []))
+            _, top_k = torch.topk(scores, k)
 
-        for item in train_items:
-            scores[item] = -1e9
+            for item in top_k.cpu().numpy():
 
-        _, top_k = torch.topk(scores, K)
-        top_k = top_k.tolist()
+                for cat in data.item_category[item]:
 
-        relevance = [1 if item in true_items else 0 for item in top_k]
+                    if data.gender[user] == 1:  # male
+                        male_exposure[cat] += 1
+                    else:  # female
+                        female_exposure[cat] += 1
 
-        dcg_val = dcg(relevance)
-        ideal = dcg(sorted(relevance, reverse=True))
-
-        ndcgs.append(dcg_val / ideal if ideal > 0 else 0)
-
-    return np.mean(ndcgs)
-
-
-# ===== GRU =====
-def compute_gru(male_recall, female_recall):
-    return abs(male_recall - female_recall)
+        return male_exposure, female_exposure

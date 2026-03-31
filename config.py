@@ -1,6 +1,8 @@
 class Config:
+    seed = 42
     emb_dim = 64
     lr = 0.001
+    lr_A = 0.005
     batch_size = 128
     epochs = 50
 
